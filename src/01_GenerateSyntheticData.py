@@ -23,6 +23,7 @@ class TrajectoryConfig:
     speed_mps: float = 25.0
     radius_m: float = 150.0
     altitude_m: float = 50.0
+    pattern: str = "circle"
 
 
 @dataclass
@@ -179,16 +180,96 @@ def integrate_quat(q: np.ndarray, omega_b: np.ndarray, dt: float) -> np.ndarray:
 
 
 def generate_trajectory(times: np.ndarray, traj_cfg: TrajectoryConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    omega = traj_cfg.speed_mps / traj_cfg.radius_m
-    east = traj_cfg.radius_m * np.cos(omega * times)
-    north = traj_cfg.radius_m * np.sin(omega * times)
-    up = np.full_like(times, traj_cfg.altitude_m)
-    pos = np.column_stack((east, north, up))
-    vel_e = -traj_cfg.radius_m * omega * np.sin(omega * times)
-    vel_n = traj_cfg.radius_m * omega * np.cos(omega * times)
-    vel_u = np.zeros_like(times)
-    vel = np.column_stack((vel_e, vel_n, vel_u))
-    yaw = np.unwrap(np.arctan2(vel_e, vel_n))
+    pattern = getattr(traj_cfg, "pattern", "circle")
+    if pattern != "multi_segment":
+        omega = traj_cfg.speed_mps / traj_cfg.radius_m
+        east = traj_cfg.radius_m * np.cos(omega * times)
+        north = traj_cfg.radius_m * np.sin(omega * times)
+        up = np.full_like(times, traj_cfg.altitude_m)
+        pos = np.column_stack((east, north, up))
+        vel_e = -traj_cfg.radius_m * omega * np.sin(omega * times)
+        vel_n = traj_cfg.radius_m * omega * np.cos(omega * times)
+        vel_u = np.zeros_like(times)
+        vel = np.column_stack((vel_e, vel_n, vel_u))
+    else:
+        total_time = traj_cfg.total_time
+        speed = traj_cfg.speed_mps
+        radius = max(traj_cfg.radius_m, 1e-6)
+        altitude = traj_cfg.altitude_m
+        t1 = 0.25 * total_time
+        t2 = 0.5 * total_time
+        t3 = 0.75 * total_time
+        t4 = total_time
+        east = np.zeros_like(times)
+        north = np.zeros_like(times)
+        up = np.zeros_like(times)
+        vel_e = np.zeros_like(times)
+        vel_n = np.zeros_like(times)
+        vel_u = np.zeros_like(times)
+
+        # Segment 1: accelerate eastward
+        mask1 = times <= t1
+        tau1 = times[mask1]
+        accel_slope = (speed - 10.0) / t1 if t1 > 0 else 0.0
+        east[mask1] = 10.0 * tau1 + 0.5 * accel_slope * tau1 * tau1
+        north[mask1] = 0.0
+        up[mask1] = altitude
+        vel_e[mask1] = 10.0 + accel_slope * tau1
+        vel_n[mask1] = 0.0
+        vel_u[mask1] = 0.0
+
+        # Segment 2: constant-speed left turn
+        mask2 = (times > t1) & (times <= t2)
+        tau2 = times[mask2] - t1
+        east_t1 = 10.0 * t1 + 0.5 * accel_slope * t1 * t1
+        north_t1 = 0.0
+        center_e = east_t1
+        center_n = north_t1 + radius
+        omega = speed / radius
+        theta2 = omega * tau2
+        east[mask2] = center_e + radius * np.sin(theta2)
+        north[mask2] = center_n - radius * np.cos(theta2)
+        up[mask2] = altitude
+        vel_e[mask2] = speed * np.cos(theta2)
+        vel_n[mask2] = speed * np.sin(theta2)
+        vel_u[mask2] = 0.0
+
+        # Segment 3: northbound climb
+        mask3 = (times > t2) & (times <= t3)
+        tau3 = times[mask3] - t2
+        theta_end = omega * (t2 - t1)
+        east_t2 = center_e + radius * np.sin(theta_end)
+        north_t2 = center_n - radius * np.cos(theta_end)
+        alt_slope = 30.0 / (t3 - t2) if (t3 - t2) > 0 else 0.0
+        east[mask3] = east_t2
+        north[mask3] = north_t2 + speed * tau3
+        up[mask3] = altitude + alt_slope * tau3
+        vel_e[mask3] = 0.0
+        vel_n[mask3] = speed
+        vel_u[mask3] = alt_slope
+
+        # Segment 4: right turn descending back
+        mask4 = times > t3
+        tau4 = times[mask4] - t3
+        north_t3 = north_t2 + speed * (t3 - t2)
+        alt_t3 = altitude + 30.0
+        speed4 = 0.8 * speed
+        omega4 = speed4 / radius
+        center_e4 = east_t2 + radius
+        center_n4 = north_t3
+        theta4 = omega4 * tau4
+        east[mask4] = center_e4 - radius * np.cos(theta4)
+        north[mask4] = center_n4 + radius * np.sin(theta4)
+        alt_desc = -30.0 / (t4 - t3) if (t4 - t3) > 0 else 0.0
+        up[mask4] = alt_t3 + alt_desc * tau4
+        vel_e[mask4] = speed4 * np.sin(theta4)
+        vel_n[mask4] = speed4 * np.cos(theta4)
+        vel_u[mask4] = alt_desc
+
+        pos = np.column_stack((east, north, up))
+        vel = np.column_stack((vel_e, vel_n, vel_u))
+
+    yaw = np.unwrap(np.arctan2(vel[:, 0], vel[:, 1]))
     roll = np.zeros_like(yaw)
     pitch = np.zeros_like(yaw)
     quats = np.array([euler_to_quat(r, p, y) for r, p, y in zip(roll, pitch, yaw)])
@@ -441,7 +522,14 @@ def run_simulation(config: SimConfig) -> None:
 
 if __name__ == "__main__":
     sim_cfg = SimConfig(
-        trajectory=TrajectoryConfig(total_time=120.0, imu_dt=0.01, speed_mps=20.0, radius_m=120.0, altitude_m=30.0),
+        trajectory=TrajectoryConfig(
+            total_time=120.0,
+            imu_dt=0.01,
+            speed_mps=20.0,
+            radius_m=120.0,
+            altitude_m=30.0,
+            pattern="multi_segment",
+        ),
         imu_errors=IMUErrorModel(
             gyro_bias_rw=5e-6,
             gyro_noise_std=5e-4,
