@@ -105,20 +105,56 @@ class DriftSequenceDataset(Dataset):
                 raise ValueError(f"Missing bias column '{col}' in {self.csv_path}")
 
         self.times = df["time"].to_numpy(dtype=np.float64)
+        # self.labels = df[bias_cols].to_numpy(dtype=np.float32)
+
+        # feature_matrix = df[self.feature_columns].to_numpy(dtype=np.float32)
+        # if feature_mean is None or feature_std is None:
+        #     self.feature_mean = feature_matrix.mean(axis=0)
+        #     self.feature_std = feature_matrix.std(axis=0) + 1e-6
+        # else:
+        #     self.feature_mean = np.asarray(feature_mean, dtype=np.float32)
+        #     self.feature_std = np.asarray(feature_std, dtype=np.float32)
+        # if self.feature_mean.shape[0] != feature_matrix.shape[1]:
+        #     raise ValueError("Feature mean/std dimension mismatch")
+        # normalized_features = (feature_matrix - self.feature_mean) / self.feature_std
+        # self.features = normalized_features.astype(np.float32)
         self.labels = df[bias_cols].to_numpy(dtype=np.float32)
 
+        # 원본 feature 행렬
         feature_matrix = df[self.feature_columns].to_numpy(dtype=np.float32)
+
+        # 1) mean/std 계산 (NaN 무시)
         if feature_mean is None or feature_std is None:
-            self.feature_mean = feature_matrix.mean(axis=0)
-            self.feature_std = feature_matrix.std(axis=0) + 1e-6
+            # NaN을 무시하고 평균/표준편차 계산
+            self.feature_mean = np.nanmean(feature_matrix, axis=0).astype(np.float32)
+            self.feature_std = np.nanstd(feature_matrix, axis=0).astype(np.float32) + 1e-6
+
+            # 혹시 어떤 컬럼이 전부 NaN이면 nanmean/nanstd가 NaN이 될 수 있으니 방어
+            self.feature_mean = np.nan_to_num(self.feature_mean, nan=0.0)
+            self.feature_std = np.nan_to_num(self.feature_std, nan=1.0)
         else:
             self.feature_mean = np.asarray(feature_mean, dtype=np.float32)
             self.feature_std = np.asarray(feature_std, dtype=np.float32)
+
         if self.feature_mean.shape[0] != feature_matrix.shape[1]:
             raise ValueError("Feature mean/std dimension mismatch")
+
+        # 2) NaN을 column mean으로 대체
+        #    → GNSS outage 구간의 NaN은 "평균값"으로 채워져서 정규화 후 0이 됨
+        nan_mask = np.isnan(feature_matrix)
+        if np.any(nan_mask):
+            # broadcasting을 위해 (1, D) 형태로 맞춰서 사용
+            feature_matrix = np.where(
+                nan_mask,
+                self.feature_mean[None, :],
+                feature_matrix,
+            )
+
+        # 3) 정규화
         normalized_features = (feature_matrix - self.feature_mean) / self.feature_std
         self.features = normalized_features.astype(np.float32)
-        self.label_dim = self.labels.shape[1]
+
+        
         total_steps = len(df)
         if total_steps < self.window_size:
             raise ValueError("Not enough samples for the requested window size")

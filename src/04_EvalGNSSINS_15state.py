@@ -269,6 +269,7 @@ gnss_idx = 0
 gnss_len = len(t_gnss)
 
 first_gnss_after_outage_done = False
+prev_gnss_valid = False
 
 for k in range(1, N):
     dt = dt_imu[k]
