@@ -268,9 +268,7 @@ I15 = np.eye(15)
 gnss_idx = 0
 gnss_len = len(t_gnss)
 
-# outage 상태 추적용 플래그
-was_in_outage = (OUTAGE_START <= t_imu[0] <= OUTAGE_END)
-did_reset_after_outage = False
+first_gnss_after_outage_done = False
 
 for k in range(1, N):
     dt = dt_imu[k]
@@ -349,51 +347,54 @@ for k in range(1, N):
 
     # ---------------------------
     # (3-1) outage 이후 "첫 GNSS"인지 체크 → hard reset
+    #   조건: 
+    #   - gnss_valid 이고
+    #   - 이 GNSS 시각은 outage 범위 밖이고
+    #   - 바로 직전 GNSS 시각은 outage 범위 안(또는 outage 종료 직전)
     # ---------------------------
-    is_first_gnss_after_outage = (
-        gnss_valid
-        and (not in_outage)
-        and was_in_outage
-        and (not did_reset_after_outage)
-    )
+    if gnss_valid and (not first_gnss_after_outage_done):
+        t_g = t_gnss[gnss_idx]
 
-    if is_first_gnss_after_outage:
-        # 1) 위치/속도는 GNSS로 강제 동기화
-        pos_lc[k] = z_pos.copy()
-        vel_lc[k] = z_vel.copy()
+        # 이 GNSS 샘플은 outage 바깥
+        if t_g > OUTAGE_END:
+            # 직전 GNSS가 있으면, 그건 outage 구간(또는 그 직전)이라고 가정
+            # (strict 하게 보려면 t_gnss[gnss_idx-1] >= OUTAGE_START 조건까지 넣을 수도 있음)
+            first_gnss_after_outage_done = True
 
-        # 2) yaw는 GNSS 속도 방향으로 재정렬 (roll/pitch는 기존 유지)
-        vE, vN, _ = vel_lc[k]
-        if np.hypot(vE, vN) > 1e-3:
-            yaw_align = np.arctan2(vE, vN)
-        else:
-            # 속도가 너무 작으면 기존 yaw 유지
-            roll_tmp, pitch_tmp, yaw_tmp = dcm_to_euler(C_nb)
-            yaw_align = yaw_tmp
+            # 1) 위치/속도는 GNSS로 강제 동기화
+            pos_lc[k] = z_pos.copy()
+            vel_lc[k] = z_vel.copy()
 
-        roll_tmp, pitch_tmp, _ = dcm_to_euler(C_nb)
-        quat_lc[k] = euler_to_quat(roll_tmp, pitch_tmp, yaw_align)
+            # 2) yaw는 GNSS 속도 방향으로 재정렬 (roll/pitch는 기존 유지)
+            vE, vN, _ = vel_lc[k]
+            if np.hypot(vE, vN) > 1e-3:
+                yaw_align = np.arctan2(vE, vN)
+            else:
+                # 속도가 너무 작으면 기존 yaw 유지
+                roll_tmp, pitch_tmp, yaw_tmp = dcm_to_euler(C_nb)
+                yaw_align = yaw_tmp
 
-        # 3) error state, 공분산 리셋
-        x[:] = 0.0
-        P = np.diag(
-            [
-                10.0, 10.0, 10.0,   # δp [m]
-                1.0, 1.0, 1.0,      # δv [m/s]
-                np.deg2rad(5.0),
-                np.deg2rad(5.0),
-                np.deg2rad(5.0),    # δψ [rad]
-                np.deg2rad(0.1),
-                np.deg2rad(0.1),
-                np.deg2rad(0.1),    # δbg [rad/s]
-                0.1, 0.1, 0.1,      # δba [m/s^2]
-            ]
-        )
+            roll_tmp, pitch_tmp, _ = dcm_to_euler(C_nb)
+            quat_lc[k] = euler_to_quat(roll_tmp, pitch_tmp, yaw_align)
 
-        did_reset_after_outage = True
-        was_in_outage = in_outage
-        # 이 샘플은 EKF update로 쓰지 않고 바로 다음 step으로
-        continue
+            # 3) error state, 공분산 리셋
+            x[:] = 0.0
+            P = np.diag(
+                [
+                    10.0, 10.0, 10.0,   # δp [m]
+                    1.0, 1.0, 1.0,      # δv [m/s]
+                    np.deg2rad(5.0),
+                    np.deg2rad(5.0),
+                    np.deg2rad(5.0),    # δψ [rad]
+                    np.deg2rad(0.1),
+                    np.deg2rad(0.1),
+                    np.deg2rad(0.1),    # δbg [rad/s]
+                    0.1, 0.1, 0.1,      # δba [m/s^2]
+                ]
+            )
+
+            # 이 샘플은 EKF update로 쓰지 않고 바로 다음 step으로
+            continue
 
     # ---------------------------
     # (3-2) 일반 GNSS update (outage 구간 밖, reset 이후)
@@ -447,9 +448,6 @@ for k in range(1, N):
         pos_lc[k] = p_pred
         vel_lc[k] = v_pred
         quat_lc[k] = q_pred
-
-    # 다음 step을 위한 outage 상태 업데이트
-    was_in_outage = in_outage
 
 
 # LC 에러
