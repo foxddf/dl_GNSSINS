@@ -1,0 +1,17 @@
+{
+  "best_val_loss": 0.0917467656545341,
+  "csv_path": "../outputs/synthetic/imu_and_ins.csv",
+  "output_path": "../outputs/artifacts/drift_gru.pt",
+  "window_size": 200,
+  "stride": 5,
+  "batch_size": 64,
+  "val_ratio": 0.2,
+  "epochs": 100,
+  "hidden_dim": 128,
+  "num_layers": 2,
+  "dropout": 0.1,
+  "lr": 0.0001,
+  "grad_clip": 1.0,
+  "include_velocity": true,
+  "seed": 42
+}
