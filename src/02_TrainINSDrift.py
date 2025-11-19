@@ -1,4 +1,4 @@
-"""PyTorch pipeline for learning INS drift from synthetic GNSS/INS sequences."""
+"""PyTorch pipeline for learning IMU bias from synthetic GNSS/INS sequences."""
 from __future__ import annotations
 
 import argparse
@@ -32,7 +32,7 @@ def set_seed(seed: int) -> None:
 
 
 class DriftSequenceDataset(Dataset):
-    """Create sliding-window IMU+INS sequences and drift labels."""
+    """Create sliding-window IMU+INS sequences and bias labels."""
 
     def __init__(
         self,
@@ -65,30 +65,47 @@ class DriftSequenceDataset(Dataset):
             "accel_x",
             "accel_y",
             "accel_z",
-            "pos_est_e",
-            "pos_est_n",
-            "pos_est_u",
+            "ins_pos_e",
+            "ins_pos_n",
+            "ins_pos_u",
         ]
         if include_velocity:
             default_features.extend([
-                "vel_est_e",
-                "vel_est_n",
-                "vel_est_u",
+                "ins_vel_e",
+                "ins_vel_n",
+                "ins_vel_u",
             ])
+        gnss_feature_cols = [
+            "gnss_pos_e",
+            "gnss_pos_n",
+            "gnss_pos_u",
+            "gnss_vel_e",
+            "gnss_vel_n",
+            "gnss_vel_u",
+        ]
+        for col in gnss_feature_cols:
+            if col in df.columns:
+                default_features.append(col)
+
         self.feature_columns = list(feature_columns) if feature_columns else default_features
         for col in self.feature_columns:
             if col not in df.columns:
                 raise ValueError(f"Missing feature column '{col}' in {self.csv_path}")
 
-        required_truth = ["pos_truth_e", "pos_truth_n", "pos_truth_u"]
-        required_est = ["pos_est_e", "pos_est_n", "pos_est_u"]
-        for col in required_truth + required_est:
+        bias_cols = [
+            "gyro_bias_x",
+            "gyro_bias_y",
+            "gyro_bias_z",
+            "accel_bias_x",
+            "accel_bias_y",
+            "accel_bias_z",
+        ]
+        for col in bias_cols:
             if col not in df.columns:
-                raise ValueError(f"Missing required column '{col}' in {self.csv_path}")
+                raise ValueError(f"Missing bias column '{col}' in {self.csv_path}")
 
         self.times = df["time"].to_numpy(dtype=np.float64)
-        self.pos_truth = df[required_truth].to_numpy(dtype=np.float32)
-        self.pos_est = df[required_est].to_numpy(dtype=np.float32)
+        self.labels = df[bias_cols].to_numpy(dtype=np.float32)
 
         feature_matrix = df[self.feature_columns].to_numpy(dtype=np.float32)
         if feature_mean is None or feature_std is None:
@@ -101,8 +118,7 @@ class DriftSequenceDataset(Dataset):
             raise ValueError("Feature mean/std dimension mismatch")
         normalized_features = (feature_matrix - self.feature_mean) / self.feature_std
         self.features = normalized_features.astype(np.float32)
-
-        self.drift = (self.pos_truth - self.pos_est).astype(np.float32)
+        self.label_dim = self.labels.shape[1]
         total_steps = len(df)
         if total_steps < self.window_size:
             raise ValueError("Not enough samples for the requested window size")
@@ -117,17 +133,21 @@ class DriftSequenceDataset(Dataset):
         start = self.indices[idx]
         end = start + self.window_size
         x = torch.from_numpy(self.features[start:end])  # (T, D)
-        y = torch.from_numpy(self.drift[end - 1])  # (3,)
+        y = torch.from_numpy(self.labels[end - 1])  # (6,)
         meta = {
             "time": torch.tensor(self.times[end - 1], dtype=torch.float32),
-            "pos_est": torch.from_numpy(self.pos_est[end - 1]),
-            "pos_truth": torch.from_numpy(self.pos_truth[end - 1]),
+            "gyro_bias_true": torch.from_numpy(self.labels[end - 1, 0:3]),
+            "accel_bias_true": torch.from_numpy(self.labels[end - 1, 3:6]),
         }
         return x, y, meta
 
     @property
     def input_dim(self) -> int:
         return self.features.shape[1]
+
+    @property
+    def label_dim(self) -> int:
+        return self.labels.shape[1]
 
 
 # -----------------------------------------------------------------------------
@@ -144,6 +164,7 @@ class DriftGRUModel(nn.Module):
         hidden_dim: int = 128,
         num_layers: int = 2,
         dropout: float = 0.1,
+        output_dim: int = 3,
     ) -> None:
         super().__init__()
         self.gru = nn.GRU(
@@ -156,7 +177,7 @@ class DriftGRUModel(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 3),
+            nn.Linear(hidden_dim, output_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -193,9 +214,9 @@ class TrainConfig:
 class EvalConfig:
     csv_path: Path
     checkpoint_path: Path
-    output_csv: Path
     window_size: int
     stride: int
+    output_csv: Path = Path("outputs/bias_predictions.csv")
     batch_size: int = 128
     include_velocity: bool = True
     device: str = "cpu"
@@ -230,6 +251,7 @@ def train_model(cfg: TrainConfig) -> None:
         hidden_dim=cfg.hidden_dim,
         num_layers=cfg.num_layers,
         dropout=cfg.dropout,
+        output_dim=full_dataset.label_dim,
     ).to(device)
     criterion = nn.HuberLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
@@ -276,6 +298,7 @@ def train_model(cfg: TrainConfig) -> None:
                     "hidden_dim": cfg.hidden_dim,
                     "num_layers": cfg.num_layers,
                     "dropout": cfg.dropout,
+                    "output_dim": full_dataset.label_dim,
                 },
             }
         print(f"Epoch {epoch:03d}/{cfg.epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
@@ -334,33 +357,37 @@ def run_evaluation(cfg: EvalConfig) -> None:
             inputs = inputs.to(device)
             preds = model(inputs).cpu().numpy()
             times = meta["time"].cpu().numpy()
-            pos_est = meta["pos_est"].cpu().numpy()
-            pos_truth = meta["pos_truth"].cpu().numpy()
-            drift_true = pos_truth - pos_est
-            pos_corr = pos_est + preds
+            gyro_bias_true = meta["gyro_bias_true"].cpu().numpy()
+            accel_bias_true = meta["accel_bias_true"].cpu().numpy()
+
             for i in range(preds.shape[0]):
+                bg_pred = preds[i, 0:3]
+                ba_pred = preds[i, 3:6]
+                bg_true = gyro_bias_true[i]
+                ba_true = accel_bias_true[i]
+
                 rows.append(
                     {
                         "time": float(times[i]),
-                        "pos_est_e": float(pos_est[i, 0]),
-                        "pos_est_n": float(pos_est[i, 1]),
-                        "pos_est_u": float(pos_est[i, 2]),
-                        "drift_pred_e": float(preds[i, 0]),
-                        "drift_pred_n": float(preds[i, 1]),
-                        "drift_pred_u": float(preds[i, 2]),
-                        "pos_corr_e": float(pos_corr[i, 0]),
-                        "pos_corr_n": float(pos_corr[i, 1]),
-                        "pos_corr_u": float(pos_corr[i, 2]),
-                        "drift_true_e": float(drift_true[i, 0]),
-                        "drift_true_n": float(drift_true[i, 1]),
-                        "drift_true_u": float(drift_true[i, 2]),
+                        "gyro_bias_pred_x": float(bg_pred[0]),
+                        "gyro_bias_pred_y": float(bg_pred[1]),
+                        "gyro_bias_pred_z": float(bg_pred[2]),
+                        "accel_bias_pred_x": float(ba_pred[0]),
+                        "accel_bias_pred_y": float(ba_pred[1]),
+                        "accel_bias_pred_z": float(ba_pred[2]),
+                        "gyro_bias_true_x": float(bg_true[0]),
+                        "gyro_bias_true_y": float(bg_true[1]),
+                        "gyro_bias_true_z": float(bg_true[2]),
+                        "accel_bias_true_x": float(ba_true[0]),
+                        "accel_bias_true_y": float(ba_true[1]),
+                        "accel_bias_true_z": float(ba_true[2]),
                     }
                 )
 
     output_df = pd.DataFrame(rows)
     cfg.output_csv.parent.mkdir(parents=True, exist_ok=True)
     output_df.to_csv(cfg.output_csv, index=False)
-    print(f"Saved drift-corrected positions to {cfg.output_csv}")
+    print(f"Saved bias predictions to {cfg.output_csv}")
 
 
 # -----------------------------------------------------------------------------
@@ -369,12 +396,22 @@ def run_evaluation(cfg: EvalConfig) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train or evaluate an INS drift predictor.")
+    parser = argparse.ArgumentParser(description="Train or evaluate an INS bias predictor.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    train_parser = subparsers.add_parser("train", help="Train a GRU drift model")
-    train_parser.add_argument("--csv", type=Path, required=True, help="Path to imu_and_ins.csv")
-    train_parser.add_argument("--output", type=Path, default=Path("checkpoints/drift_gru.pt"), help="Where to save the trained model")
+    train_parser = subparsers.add_parser("train", help="Train a GRU bias model")
+    train_parser.add_argument(
+        "--csv",
+        type=Path,
+        required=True,
+        help="Path to bias_training.csv (generated by 01_GenerateSyntheticData.py)",
+    )
+    train_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("checkpoints/drift_gru.pt"),
+        help="Where to save the trained model",
+    )
     train_parser.add_argument("--window-size", type=int, default=200)
     train_parser.add_argument("--stride", type=int, default=5)
     train_parser.add_argument("--batch-size", type=int, default=64)
@@ -388,10 +425,20 @@ def parse_args() -> argparse.Namespace:
     train_parser.add_argument("--no-velocity", action="store_true", help="Exclude velocity estimates from inputs")
     train_parser.add_argument("--seed", type=int, default=42)
 
-    eval_parser = subparsers.add_parser("eval", help="Evaluate a trained model and export corrected positions")
-    eval_parser.add_argument("--csv", type=Path, required=True, help="Path to imu_and_ins.csv for evaluation")
+    eval_parser = subparsers.add_parser("eval", help="Evaluate a trained model and export bias predictions")
+    eval_parser.add_argument(
+        "--csv",
+        type=Path,
+        required=True,
+        help="Path to bias_training.csv (generated by 01_GenerateSyntheticData.py)",
+    )
     eval_parser.add_argument("--checkpoint", type=Path, required=True, help="Path to trained model checkpoint")
-    eval_parser.add_argument("--output-csv", type=Path, default=Path("outputs/drift_corrections.csv"))
+    eval_parser.add_argument(
+        "--output-csv",
+        type=Path,
+        default=Path("outputs/bias_predictions.csv"),
+        help="Where to save the predicted and true biases",
+    )
     eval_parser.add_argument("--window-size", type=int, default=200)
     eval_parser.add_argument("--stride", type=int, default=1)
     eval_parser.add_argument("--batch-size", type=int, default=128)
