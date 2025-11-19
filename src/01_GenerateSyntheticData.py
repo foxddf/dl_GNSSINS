@@ -349,12 +349,14 @@ def add_imu_errors(
     imu_cfg: IMUErrorModel,
     dt: float,
     rng: np.random.Generator,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n = len(gyro_true)
     gyro_bias = rng.normal(0.0, imu_cfg.gyro_bias_init_std, size=3)
     accel_bias = rng.normal(0.0, imu_cfg.accel_bias_init_std, size=3)
     gyro_meas = np.zeros_like(gyro_true)
     accel_meas = np.zeros_like(accel_true)
+    gyro_bias_hist = np.zeros_like(gyro_true)
+    accel_bias_hist = np.zeros_like(accel_true)
     for k in range(n):
         gyro_bias += imu_cfg.gyro_bias_rw * math.sqrt(dt) * rng.normal(size=3)
         accel_bias += imu_cfg.accel_bias_rw * math.sqrt(dt) * rng.normal(size=3)
@@ -362,7 +364,9 @@ def add_imu_errors(
         accel_noise = (imu_cfg.accel_noise_std / math.sqrt(dt)) * rng.normal(size=3)
         gyro_meas[k] = gyro_true[k] + gyro_bias + gyro_noise
         accel_meas[k] = accel_true[k] + accel_bias + accel_noise
-    return gyro_meas, accel_meas
+        gyro_bias_hist[k] = gyro_bias
+        accel_bias_hist[k] = accel_bias
+    return gyro_meas, accel_meas, gyro_bias_hist, accel_bias_hist
 
 
 def ins_mechanization(
@@ -441,7 +445,12 @@ def run_simulation(config: SimConfig) -> None:
         config.origin_lon_deg,
         config.origin_height_m,
     )
-    gyro_meas, accel_meas = add_imu_errors(gyro_true, accel_true, config.imu_errors, config.trajectory.imu_dt, rng)
+    (
+        gyro_meas,
+        accel_meas,
+        gyro_bias_hist,
+        accel_bias_hist,
+    ) = add_imu_errors(gyro_true, accel_true, config.imu_errors, config.trajectory.imu_dt, rng)
     pos_est, vel_est, quats_est = ins_mechanization(
         imu_times,
         gyro_meas,
@@ -461,37 +470,80 @@ def run_simulation(config: SimConfig) -> None:
         config.gnss,
         rng,
     )
+    gnss_pos_interp = np.full_like(pos_truth, np.nan)
+    gnss_vel_interp = np.full_like(vel_truth, np.nan)
+    gnss_nan_mask = np.any(np.isnan(gnss_pos_meas), axis=1) | np.any(np.isnan(gnss_vel_meas), axis=1)
+    outage_intervals: list[Tuple[float, float]] = []
+    if np.any(gnss_nan_mask):
+        nan_indices = np.where(gnss_nan_mask)[0]
+        start_idx = nan_indices[0]
+        prev_idx = nan_indices[0]
+        for idx in nan_indices[1:]:
+            if idx == prev_idx + 1:
+                prev_idx = idx
+                continue
+            outage_intervals.append((gnss_times[start_idx], gnss_times[prev_idx]))
+            start_idx = idx
+            prev_idx = idx
+        outage_intervals.append((gnss_times[start_idx], gnss_times[prev_idx]))
+    imu_outage_mask = np.zeros_like(imu_times, dtype=bool)
+    for start, end in outage_intervals:
+        imu_outage_mask |= (imu_times >= start) & (imu_times <= end)
+    for i in range(3):
+        valid_pos = ~np.isnan(gnss_pos_meas[:, i])
+        if np.any(valid_pos):
+            gnss_pos_interp[:, i] = np.interp(
+                imu_times,
+                gnss_times[valid_pos],
+                gnss_pos_meas[valid_pos, i],
+                left=np.nan,
+                right=np.nan,
+            )
+        valid_vel = ~np.isnan(gnss_vel_meas[:, i])
+        if np.any(valid_vel):
+            gnss_vel_interp[:, i] = np.interp(
+                imu_times,
+                gnss_times[valid_vel],
+                gnss_vel_meas[valid_vel, i],
+                left=np.nan,
+                right=np.nan,
+            )
+    gnss_pos_interp[imu_outage_mask] = np.nan
+    gnss_vel_interp[imu_outage_mask] = np.nan
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     imu_df = pd.DataFrame(
-    {
-        "time": imu_times,
-        "gyro_x": gyro_meas[:, 0],
-        "gyro_y": gyro_meas[:, 1],
-        "gyro_z": gyro_meas[:, 2],
-        "accel_x": accel_meas[:, 0],
-        "accel_y": accel_meas[:, 1],
-        "accel_z": accel_meas[:, 2],
-
-        "pos_truth_e": pos_truth[:, 0],
-        "pos_truth_n": pos_truth[:, 1],
-        "pos_truth_u": pos_truth[:, 2],
-        "vel_truth_e": vel_truth[:, 0],
-        "vel_truth_n": vel_truth[:, 1],
-        "vel_truth_u": vel_truth[:, 2],
-
-        "pos_est_e": pos_est[:, 0],
-        "pos_est_n": pos_est[:, 1],
-        "pos_est_u": pos_est[:, 2],
-        "vel_est_e": vel_est[:, 0],
-        "vel_est_n": vel_est[:, 1],
-        "vel_est_u": vel_est[:, 2],
-
-        "ins_q_w": quats_est[:, 0],
-        "ins_q_x": quats_est[:, 1],
-        "ins_q_y": quats_est[:, 2],
-        "ins_q_z": quats_est[:, 3],
+        {
+            "time": imu_times,
+            "gyro_x": gyro_meas[:, 0],
+            "gyro_y": gyro_meas[:, 1],
+            "gyro_z": gyro_meas[:, 2],
+            "accel_x": accel_meas[:, 0],
+            "accel_y": accel_meas[:, 1],
+            "accel_z": accel_meas[:, 2],
+            "pos_truth_e": pos_truth[:, 0],
+            "pos_truth_n": pos_truth[:, 1],
+            "pos_truth_u": pos_truth[:, 2],
+            "vel_truth_e": vel_truth[:, 0],
+            "vel_truth_n": vel_truth[:, 1],
+            "vel_truth_u": vel_truth[:, 2],
+            "pos_est_e": pos_est[:, 0],
+            "pos_est_n": pos_est[:, 1],
+            "pos_est_u": pos_est[:, 2],
+            "vel_est_e": vel_est[:, 0],
+            "vel_est_n": vel_est[:, 1],
+            "vel_est_u": vel_est[:, 2],
+            "ins_q_w": quats_est[:, 0],
+            "ins_q_x": quats_est[:, 1],
+            "ins_q_y": quats_est[:, 2],
+            "ins_q_z": quats_est[:, 3],
+            "gyro_bias_x": gyro_bias_hist[:, 0],
+            "gyro_bias_y": gyro_bias_hist[:, 1],
+            "gyro_bias_z": gyro_bias_hist[:, 2],
+            "accel_bias_x": accel_bias_hist[:, 0],
+            "accel_bias_y": accel_bias_hist[:, 1],
+            "accel_bias_z": accel_bias_hist[:, 2],
         }
     )
 
@@ -516,8 +568,46 @@ def run_simulation(config: SimConfig) -> None:
     )
     gnss_path = output_dir / "gnss.csv"
     gnss_df.to_csv(gnss_path, index=False)
+    bias_df = pd.DataFrame(
+        {
+            "time": imu_times,
+            "gyro_x": gyro_meas[:, 0],
+            "gyro_y": gyro_meas[:, 1],
+            "gyro_z": gyro_meas[:, 2],
+            "accel_x": accel_meas[:, 0],
+            "accel_y": accel_meas[:, 1],
+            "accel_z": accel_meas[:, 2],
+            "ins_pos_e": pos_est[:, 0],
+            "ins_pos_n": pos_est[:, 1],
+            "ins_pos_u": pos_est[:, 2],
+            "ins_vel_e": vel_est[:, 0],
+            "ins_vel_n": vel_est[:, 1],
+            "ins_vel_u": vel_est[:, 2],
+            "gnss_pos_e": gnss_pos_interp[:, 0],
+            "gnss_pos_n": gnss_pos_interp[:, 1],
+            "gnss_pos_u": gnss_pos_interp[:, 2],
+            "gnss_vel_e": gnss_vel_interp[:, 0],
+            "gnss_vel_n": gnss_vel_interp[:, 1],
+            "gnss_vel_u": gnss_vel_interp[:, 2],
+            "truth_pos_e": pos_truth[:, 0],
+            "truth_pos_n": pos_truth[:, 1],
+            "truth_pos_u": pos_truth[:, 2],
+            "truth_vel_e": vel_truth[:, 0],
+            "truth_vel_n": vel_truth[:, 1],
+            "truth_vel_u": vel_truth[:, 2],
+            "gyro_bias_x": gyro_bias_hist[:, 0],
+            "gyro_bias_y": gyro_bias_hist[:, 1],
+            "gyro_bias_z": gyro_bias_hist[:, 2],
+            "accel_bias_x": accel_bias_hist[:, 0],
+            "accel_bias_y": accel_bias_hist[:, 1],
+            "accel_bias_z": accel_bias_hist[:, 2],
+        }
+    )
+    bias_path = output_dir / "bias_training.csv"
+    bias_df.to_csv(bias_path, index=False)
     print(f"Saved IMU+INS data to {imu_path}")
     print(f"Saved GNSS data to {gnss_path}")
+    print(f"Saved bias training data to {bias_path}")
 
 
 if __name__ == "__main__":
