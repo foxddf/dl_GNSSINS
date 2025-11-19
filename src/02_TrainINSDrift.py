@@ -285,9 +285,19 @@ def train_model(cfg: TrainConfig) -> None:
 
     cfg.output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(best_state, cfg.output_path)
+
     meta_path = cfg.output_path.with_suffix(".json")
+
+    cfg_dict = asdict(cfg)
+    # Path 객체들을 문자열로 변환
+    for k, v in cfg_dict.items():
+        if isinstance(v, Path):
+            cfg_dict[k] = str(v)
+
+    meta = {"best_val_loss": best_val_loss, **cfg_dict}
+
     with meta_path.open("w", encoding="utf-8") as f:
-        json.dump({"best_val_loss": best_val_loss, **asdict(cfg)}, f, indent=2)
+        json.dump(meta, f, indent=2)
     print(f"Saved best model with val loss {best_val_loss:.6f} to {cfg.output_path}")
 
 
@@ -298,7 +308,11 @@ def train_model(cfg: TrainConfig) -> None:
 
 def run_evaluation(cfg: EvalConfig) -> None:
     device = torch.device(cfg.device)
-    checkpoint = torch.load(cfg.checkpoint_path, map_location=device)
+    checkpoint = torch.load(
+    cfg.checkpoint_path,
+    map_location=device,
+    weights_only=False,  # PyTorch 2.6 이상에서 필요
+    )
     model_args = checkpoint["model_args"]
     model = DriftGRUModel(**model_args).to(device)
     model.load_state_dict(checkpoint["model_state"])

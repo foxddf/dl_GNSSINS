@@ -382,33 +382,38 @@ def run_simulation(config: SimConfig) -> None:
     )
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+    
     imu_df = pd.DataFrame(
-        {
-            "time": imu_times,
-            "gyro_x": gyro_meas[:, 0],
-            "gyro_y": gyro_meas[:, 1],
-            "gyro_z": gyro_meas[:, 2],
-            "accel_x": accel_meas[:, 0],
-            "accel_y": accel_meas[:, 1],
-            "accel_z": accel_meas[:, 2],
-            "truth_pos_e": pos_truth[:, 0],
-            "truth_pos_n": pos_truth[:, 1],
-            "truth_pos_u": pos_truth[:, 2],
-            "truth_vel_e": vel_truth[:, 0],
-            "truth_vel_n": vel_truth[:, 1],
-            "truth_vel_u": vel_truth[:, 2],
-            "ins_pos_e": pos_est[:, 0],
-            "ins_pos_n": pos_est[:, 1],
-            "ins_pos_u": pos_est[:, 2],
-            "ins_vel_e": vel_est[:, 0],
-            "ins_vel_n": vel_est[:, 1],
-            "ins_vel_u": vel_est[:, 2],
-            "ins_q_w": quats_est[:, 0],
-            "ins_q_x": quats_est[:, 1],
-            "ins_q_y": quats_est[:, 2],
-            "ins_q_z": quats_est[:, 3],
+    {
+        "time": imu_times,
+        "gyro_x": gyro_meas[:, 0],
+        "gyro_y": gyro_meas[:, 1],
+        "gyro_z": gyro_meas[:, 2],
+        "accel_x": accel_meas[:, 0],
+        "accel_y": accel_meas[:, 1],
+        "accel_z": accel_meas[:, 2],
+
+        "pos_truth_e": pos_truth[:, 0],
+        "pos_truth_n": pos_truth[:, 1],
+        "pos_truth_u": pos_truth[:, 2],
+        "vel_truth_e": vel_truth[:, 0],
+        "vel_truth_n": vel_truth[:, 1],
+        "vel_truth_u": vel_truth[:, 2],
+
+        "pos_est_e": pos_est[:, 0],
+        "pos_est_n": pos_est[:, 1],
+        "pos_est_u": pos_est[:, 2],
+        "vel_est_e": vel_est[:, 0],
+        "vel_est_n": vel_est[:, 1],
+        "vel_est_u": vel_est[:, 2],
+
+        "ins_q_w": quats_est[:, 0],
+        "ins_q_x": quats_est[:, 1],
+        "ins_q_y": quats_est[:, 2],
+        "ins_q_z": quats_est[:, 3],
         }
     )
+
     imu_path = output_dir / "imu_and_ins.csv"
     imu_df.to_csv(imu_path, index=False)
     gnss_df = pd.DataFrame(
