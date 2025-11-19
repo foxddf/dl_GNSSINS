@@ -54,7 +54,7 @@ class SimConfig:
     gnss: GNSSNoiseModel = field(default_factory=GNSSNoiseModel)
     gravity: float = 9.80665
     seed: int = 42
-    output_dir: Path = Path("outputs")
+    output_dir: Path = Path("../outputs/synthetic")
 
 
 def generate_time_axes(traj_cfg: TrajectoryConfig, gnss_dt: float) -> Tuple[np.ndarray, np.ndarray]:
