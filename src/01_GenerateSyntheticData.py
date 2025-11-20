@@ -627,6 +627,6 @@ if __name__ == "__main__":
             accel_noise_std=1e-3,
         ),
         gnss=GNSSNoiseModel(dt=1.0, pos_noise_std=1.5, vel_noise_std=0.2, outage_intervals=((40.0, 60.0),)),
-        output_dir=Path("outputs"),
+        output_dir=Path("../outputs/synthetic"),
     )
     run_simulation(sim_cfg)
