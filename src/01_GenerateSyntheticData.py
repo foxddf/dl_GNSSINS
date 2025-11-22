@@ -510,6 +510,22 @@ def run_simulation(config: SimConfig) -> None:
             )
     gnss_pos_interp[imu_outage_mask] = np.nan
     gnss_vel_interp[imu_outage_mask] = np.nan
+    pos_residuals = pos_est - gnss_pos_interp
+    vel_residuals = vel_est - gnss_vel_interp
+    gnss_valid = (
+        np.all(np.isfinite(gnss_pos_interp), axis=1)
+        & np.all(np.isfinite(gnss_vel_interp), axis=1)
+    ).astype(int)
+    time_since_gnss = np.zeros_like(imu_times)
+    for k in range(len(imu_times)):
+        if gnss_valid[k]:
+            time_since_gnss[k] = 0.0
+        elif k == 0:
+            time_since_gnss[k] = np.inf
+        else:
+            time_since_gnss[k] = time_since_gnss[k - 1] + (imu_times[k] - imu_times[k - 1])
+    gyro_norm = np.linalg.norm(gyro_meas, axis=1)
+    accel_norm = np.linalg.norm(accel_meas, axis=1)
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -583,12 +599,22 @@ def run_simulation(config: SimConfig) -> None:
             "ins_vel_e": vel_est[:, 0],
             "ins_vel_n": vel_est[:, 1],
             "ins_vel_u": vel_est[:, 2],
+            "ins_q_w": quats_est[:, 0],
+            "ins_q_x": quats_est[:, 1],
+            "ins_q_y": quats_est[:, 2],
+            "ins_q_z": quats_est[:, 3],
             "gnss_pos_e": gnss_pos_interp[:, 0],
             "gnss_pos_n": gnss_pos_interp[:, 1],
             "gnss_pos_u": gnss_pos_interp[:, 2],
             "gnss_vel_e": gnss_vel_interp[:, 0],
             "gnss_vel_n": gnss_vel_interp[:, 1],
             "gnss_vel_u": gnss_vel_interp[:, 2],
+            "pos_res_e": pos_residuals[:, 0],
+            "pos_res_n": pos_residuals[:, 1],
+            "pos_res_u": pos_residuals[:, 2],
+            "vel_res_e": vel_residuals[:, 0],
+            "vel_res_n": vel_residuals[:, 1],
+            "vel_res_u": vel_residuals[:, 2],
             "truth_pos_e": pos_truth[:, 0],
             "truth_pos_n": pos_truth[:, 1],
             "truth_pos_u": pos_truth[:, 2],
@@ -601,6 +627,10 @@ def run_simulation(config: SimConfig) -> None:
             "accel_bias_x": accel_bias_hist[:, 0],
             "accel_bias_y": accel_bias_hist[:, 1],
             "accel_bias_z": accel_bias_hist[:, 2],
+            "gnss_valid": gnss_valid,
+            "time_since_gnss": time_since_gnss,
+            "gyro_norm": gyro_norm,
+            "accel_norm": accel_norm,
         }
     )
     bias_path = output_dir / "bias_training.csv"
