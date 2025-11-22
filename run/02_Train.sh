@@ -1,5 +1,5 @@
 python ../src/02_TrainINSDrift.py train \
-    --csv ../outputs/synthetic/bias_training.csv \
+    --csv ../outputs/synthetic_multi/all_bias_training.csv \
     --output ../outputs/artifacts/drift_gru.pt \
     --window-size 200 \
     --stride 5 \

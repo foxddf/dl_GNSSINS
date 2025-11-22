@@ -30,6 +30,7 @@ def set_seed(seed: int) -> None:
 # Dataset definition
 # -----------------------------------------------------------------------------
 
+
 class DriftSequenceDataset(Dataset):
     """Create sliding-window IMU+INS sequences and bias labels."""
 
@@ -56,66 +57,41 @@ class DriftSequenceDataset(Dataset):
         if "time" not in df.columns:
             raise ValueError("CSV must contain a 'time' column")
 
-        # ------------------------------------------------------------------
-        # 1) 기본 feature 구성
-        #    - IMU: gyro, accel (+ norm)
-        #    - INS: position, velocity, quaternion
-        #    - GNSS: pos/vel
-        #    - residual: pos_res, vel_res
-        #    - meta: gnss_valid, time_since_gnss
-        # ------------------------------------------------------------------
-        default_features: List[str] = [
-            # IMU 직접 측정값
+        # Prepare default feature set if none provided
+        default_features = [
             "gyro_x",
             "gyro_y",
             "gyro_z",
             "accel_x",
             "accel_y",
             "accel_z",
-            # INS 추정 위치
             "ins_pos_e",
             "ins_pos_n",
             "ins_pos_u",
         ]
-
         if include_velocity:
-            default_features.extend(
-                [
-                    "ins_vel_e",
-                    "ins_vel_n",
-                    "ins_vel_u",
-                ]
-            )
-
-        # 추가적으로 사용할 수 있는 feature 그룹들
-        extra_feature_groups = [
-            # INS attitude (quaternion)
-            ["ins_q_w", "ins_q_x", "ins_q_y", "ins_q_z"],
-            # GNSS 측정값 (interpolated)
-            ["gnss_pos_e", "gnss_pos_n", "gnss_pos_u"],
-            ["gnss_vel_e", "gnss_vel_n", "gnss_vel_u"],
-            # INS - GNSS residual
-            ["pos_res_e", "pos_res_n", "pos_res_u"],
-            ["vel_res_e", "vel_res_n", "vel_res_u"],
-            # IMU norm
-            ["gyro_norm", "accel_norm"],
-            # GNSS 상태
-            ["gnss_valid", "time_since_gnss"],
+            default_features.extend([
+                "ins_vel_e",
+                "ins_vel_n",
+                "ins_vel_u",
+            ])
+        gnss_feature_cols = [
+            "gnss_pos_e",
+            "gnss_pos_n",
+            "gnss_pos_u",
+            "gnss_vel_e",
+            "gnss_vel_n",
+            "gnss_vel_u",
         ]
+        for col in gnss_feature_cols:
+            if col in df.columns:
+                default_features.append(col)
 
-        # 실제 CSV에 존재하는 컬럼만 추가
-        for group in extra_feature_groups:
-            for col in group:
-                if col in df.columns and col not in default_features:
-                    default_features.append(col)
-
-        # 사용자가 feature_columns를 직접 주면 그것을 우선 사용
         self.feature_columns = list(feature_columns) if feature_columns else default_features
         for col in self.feature_columns:
             if col not in df.columns:
                 raise ValueError(f"Missing feature column '{col}' in {self.csv_path}")
 
-        # 라벨: gyro/accel bias 6개 (01_Generate에서 그대로 유지)
         bias_cols = [
             "gyro_bias_x",
             "gyro_bias_y",
@@ -129,6 +105,19 @@ class DriftSequenceDataset(Dataset):
                 raise ValueError(f"Missing bias column '{col}' in {self.csv_path}")
 
         self.times = df["time"].to_numpy(dtype=np.float64)
+        # self.labels = df[bias_cols].to_numpy(dtype=np.float32)
+
+        # feature_matrix = df[self.feature_columns].to_numpy(dtype=np.float32)
+        # if feature_mean is None or feature_std is None:
+        #     self.feature_mean = feature_matrix.mean(axis=0)
+        #     self.feature_std = feature_matrix.std(axis=0) + 1e-6
+        # else:
+        #     self.feature_mean = np.asarray(feature_mean, dtype=np.float32)
+        #     self.feature_std = np.asarray(feature_std, dtype=np.float32)
+        # if self.feature_mean.shape[0] != feature_matrix.shape[1]:
+        #     raise ValueError("Feature mean/std dimension mismatch")
+        # normalized_features = (feature_matrix - self.feature_mean) / self.feature_std
+        # self.features = normalized_features.astype(np.float32)
         self.labels = df[bias_cols].to_numpy(dtype=np.float32)
 
         # 원본 feature 행렬
@@ -136,10 +125,11 @@ class DriftSequenceDataset(Dataset):
 
         # 1) mean/std 계산 (NaN 무시)
         if feature_mean is None or feature_std is None:
+            # NaN을 무시하고 평균/표준편차 계산
             self.feature_mean = np.nanmean(feature_matrix, axis=0).astype(np.float32)
             self.feature_std = np.nanstd(feature_matrix, axis=0).astype(np.float32) + 1e-6
 
-            # 어떤 컬럼이 전부 NaN이면 nanmean/nanstd가 NaN일 수 있으므로 방어
+            # 혹시 어떤 컬럼이 전부 NaN이면 nanmean/nanstd가 NaN이 될 수 있으니 방어
             self.feature_mean = np.nan_to_num(self.feature_mean, nan=0.0)
             self.feature_std = np.nan_to_num(self.feature_std, nan=1.0)
         else:
@@ -153,6 +143,7 @@ class DriftSequenceDataset(Dataset):
         #    → GNSS outage 구간의 NaN은 "평균값"으로 채워져서 정규화 후 0이 됨
         nan_mask = np.isnan(feature_matrix)
         if np.any(nan_mask):
+            # broadcasting을 위해 (1, D) 형태로 맞춰서 사용
             feature_matrix = np.where(
                 nan_mask,
                 self.feature_mean[None, :],
@@ -163,6 +154,7 @@ class DriftSequenceDataset(Dataset):
         normalized_features = (feature_matrix - self.feature_mean) / self.feature_std
         self.features = normalized_features.astype(np.float32)
 
+        
         total_steps = len(df)
         if total_steps < self.window_size:
             raise ValueError("Not enough samples for the requested window size")
@@ -177,7 +169,7 @@ class DriftSequenceDataset(Dataset):
         start = self.indices[idx]
         end = start + self.window_size
         x = torch.from_numpy(self.features[start:end])  # (T, D)
-        y = torch.from_numpy(self.labels[end - 1])      # (6,)
+        y = torch.from_numpy(self.labels[end - 1])  # (6,)
         meta = {
             "time": torch.tensor(self.times[end - 1], dtype=torch.float32),
             "gyro_bias_true": torch.from_numpy(self.labels[end - 1, 0:3]),
@@ -197,6 +189,7 @@ class DriftSequenceDataset(Dataset):
 # -----------------------------------------------------------------------------
 # Model definition
 # -----------------------------------------------------------------------------
+
 
 class DriftGRUModel(nn.Module):
     """GRU encoder followed by MLP regression head."""
@@ -233,6 +226,7 @@ class DriftGRUModel(nn.Module):
 # -----------------------------------------------------------------------------
 # Training utilities
 # -----------------------------------------------------------------------------
+
 
 @dataclass
 class TrainConfig:
@@ -354,7 +348,7 @@ def train_model(cfg: TrainConfig) -> None:
     meta_path = cfg.output_path.with_suffix(".json")
 
     cfg_dict = asdict(cfg)
-    # Path 객체들을 문자열로 문자열로 변환
+    # Path 객체들을 문자열로 변환
     for k, v in cfg_dict.items():
         if isinstance(v, Path):
             cfg_dict[k] = str(v)
@@ -370,12 +364,13 @@ def train_model(cfg: TrainConfig) -> None:
 # Evaluation utilities
 # -----------------------------------------------------------------------------
 
+
 def run_evaluation(cfg: EvalConfig) -> None:
     device = torch.device(cfg.device)
     checkpoint = torch.load(
-        cfg.checkpoint_path,
-        map_location=device,
-        weights_only=False,  # PyTorch 2.6 이상에서 필요
+    cfg.checkpoint_path,
+    map_location=device,
+    weights_only=False,  # PyTorch 2.6 이상에서 필요
     )
     model_args = checkpoint["model_args"]
     model = DriftGRUModel(**model_args).to(device)
@@ -435,6 +430,7 @@ def run_evaluation(cfg: EvalConfig) -> None:
 # Command-line interface
 # -----------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train or evaluate an INS bias predictor.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -444,7 +440,7 @@ def parse_args() -> argparse.Namespace:
         "--csv",
         type=Path,
         required=True,
-        help="Path to bias_training.csv (generated by the synthetic GNSS/INS simulator)",
+        help="Path to bias_training.csv (generated by 01_GenerateSyntheticData.py)",
     )
     train_parser.add_argument(
         "--output",
@@ -470,7 +466,7 @@ def parse_args() -> argparse.Namespace:
         "--csv",
         type=Path,
         required=True,
-        help="Path to bias_training.csv (generated by the synthetic GNSS/INS simulator)",
+        help="Path to bias_training.csv (generated by 01_GenerateSyntheticData.py)",
     )
     eval_parser.add_argument("--checkpoint", type=Path, required=True, help="Path to trained model checkpoint")
     eval_parser.add_argument(
