@@ -13,6 +13,7 @@ from GenerateSyntheticData import (  # <= 여기 이름을 실제 파일명에 �
 def random_outages(total_time: float, rng: np.random.Generator, max_outages: int = 2):
     """총 비행시간 안에서 랜덤 GNSS outage interval들을 만들어준다."""
     n_out = rng.integers(0, max_outages + 1)  # 0, 1, 2개 중 하나
+    n_out = 1 # 1개 고정
     intervals = []
     for _ in range(n_out):
         start = rng.uniform(0.1 * total_time, 0.8 * total_time)

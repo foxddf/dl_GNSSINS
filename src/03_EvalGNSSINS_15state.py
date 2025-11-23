@@ -14,15 +14,13 @@ from typing import Optional, Sequence, Dict, Tuple, List
 # -------------------------------------------------------------------
 # 설정값
 # -------------------------------------------------------------------
-IMU_CSV   = "../outputs/synthetic_multi/scenario_000/imu_and_ins.csv"
-GNSS_CSV  = "../outputs/synthetic_multi/scenario_000//gnss.csv"
+scenario_num = "scenario_011"
+IMU_CSV   = "../outputs/synthetic_multi/" + scenario_num + "/imu_and_ins.csv"
+GNSS_CSV  = "../outputs/synthetic_multi/" + scenario_num + "/gnss.csv"
 
 # GRU가 학습에 사용한 bias_training.csv & 체크포인트
-BIAS_CSV        = "../outputs/synthetic_multi/scenario_000/bias_training.csv"
+BIAS_CSV        = "../outputs/synthetic_multi/" + scenario_num + "/bias_training.csv"
 CHECKPOINT_PATH = "../outputs/artifacts/drift_gru.pt"
-
-OUTAGE_START = 40.0  # [s]
-OUTAGE_END   = 60.0  # [s]
 
 G = 9.80665  # [m/s^2]
 
@@ -367,7 +365,12 @@ def apply_small_angle_to_dcm(C_nb: np.ndarray, dpsi: np.ndarray) -> np.ndarray:
 #    - use_ai_bias=False : EKF only (baseline)
 #    - use_ai_bias=True  : EKF + GRU bias (outage 구간에서만 보정)
 # -------------------------------------------------------------------
-def run_ekf(use_ai_bias: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def run_ekf(
+    use_ai_bias: bool,
+    outage_mask_imu: np.ndarray,
+    outage_recovery_time: Optional[float],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+
     """
     return:
         pos_lc, vel_lc, quat_lc  (모두 shape: (N, 3 또는 4))
@@ -420,7 +423,8 @@ def run_ekf(use_ai_bias: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
             dt = 1e-3
 
         t_k = t_imu[k]
-        in_outage = (OUTAGE_START <= t_k <= OUTAGE_END)
+        in_outage = bool(outage_mask_imu[k])
+
 
         # ---------- (1) nominal INS propagate ----------
         q_prev = quat_lc[k - 1]
@@ -477,15 +481,13 @@ def run_ekf(use_ai_bias: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
                 if (
                     not np.any(np.isnan(z_pos))
                     and not np.any(np.isnan(z_vel))
-                    and not (OUTAGE_START <= t_gnss[gnss_idx] <= OUTAGE_END)
                 ):
                     gnss_valid = True
                     z = np.concatenate([z_pos, z_vel])
 
-        # outage 이후 첫 GNSS → hard reset
-        if gnss_valid and (not first_gnss_after_outage_done):
+        if gnss_valid and (not first_gnss_after_outage_done) and (outage_recovery_time is not None):
             t_g = t_gnss[gnss_idx]
-            if t_g > OUTAGE_END:
+            if t_g >= outage_recovery_time:
                 first_gnss_after_outage_done = True
 
                 pos_lc[k] = z_pos.copy()
@@ -515,6 +517,7 @@ def run_ekf(use_ai_bias: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
                     ]
                 )
                 continue
+
 
         # 일반 GNSS update
         if gnss_valid and z is not None:
@@ -590,6 +593,27 @@ gnss_vel = df_gnss[["gnss_vel_e", "gnss_vel_n", "gnss_vel_u"]].values
 N = len(t_imu)
 dt_imu = np.diff(t_imu, prepend=t_imu[0])
 g_n = np.array([0.0, 0.0, -G])  # ENU up 기준
+
+
+# -------------------------------------------------------------------
+# 1-a) bias_training.csv 기반 GNSS outage 자동 검출
+# -------------------------------------------------------------------
+df_bias = pd.read_csv(BIAS_CSV)
+t_bias = df_bias["time"].to_numpy()
+gnss_valid_bias = df_bias["gnss_valid"].to_numpy().astype(float)
+
+# IMU 시간축으로 보간 → 0이면 outage, 1이면 정상
+gnss_valid_imu = np.interp(t_imu, t_bias, gnss_valid_bias)
+outage_mask_imu = gnss_valid_imu < 0.5
+
+# outage → 정상으로 넘어가는 첫 시점(복구 시간) 찾기
+recovery_edges = np.where(outage_mask_imu[:-1] & (~outage_mask_imu[1:]))[0]
+outage_recovery_time = None
+if len(recovery_edges) > 0:
+    outage_recovery_index = recovery_edges[0] + 1
+    outage_recovery_time = t_imu[outage_recovery_index]
+
+print(f"[outage detection] recovery_time = {outage_recovery_time}")
 
 
 # -------------------------------------------------------------------
@@ -685,15 +709,24 @@ for k in range(1, N):
 err_ins = np.linalg.norm(pos_dr - truth_pos, axis=1)
 
 # EKF baseline (GRU 미사용)
-pos_lc_base, vel_lc_base, quat_lc_base = run_ekf(use_ai_bias=False)
+pos_lc_base, vel_lc_base, quat_lc_base = run_ekf(
+    use_ai_bias=False,
+    outage_mask_imu=outage_mask_imu,
+    outage_recovery_time=outage_recovery_time,
+)
 err_lc_base = np.linalg.norm(pos_lc_base - truth_pos, axis=1)
 
 # EKF + GRU bias
-pos_lc_ai, vel_lc_ai, quat_lc_ai = run_ekf(use_ai_bias=True)
+pos_lc_ai, vel_lc_ai, quat_lc_ai = run_ekf(
+    use_ai_bias=True,
+    outage_mask_imu=outage_mask_imu,
+    outage_recovery_time=outage_recovery_time,
+)
 err_lc_ai = np.linalg.norm(pos_lc_ai - truth_pos, axis=1)
 
-# outage 구간 마스크
-outage_mask = (t_imu >= OUTAGE_START) & (t_imu <= OUTAGE_END)
+# outage 구간 마스크 (자동 검출 결과)
+outage_mask = outage_mask_imu
+
 
 rmse_ins_outage    = np.sqrt(np.mean(err_ins[outage_mask] ** 2))
 rmse_lc_base_out   = np.sqrt(np.mean(err_lc_base[outage_mask] ** 2))
