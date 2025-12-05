@@ -14,7 +14,7 @@ from typing import Optional, Sequence, Dict, Tuple, List
 # -------------------------------------------------------------------
 # 설정값
 # -------------------------------------------------------------------
-scenario_num = "scenario_011"
+scenario_num = "scenario_006"
 IMU_CSV   = "../outputs/synthetic_multi/" + scenario_num + "/imu_and_ins.csv"
 GNSS_CSV  = "../outputs/synthetic_multi/" + scenario_num + "/gnss.csv"
 
@@ -27,8 +27,10 @@ G = 9.80665  # [m/s^2]
 # 프로세스 노이즈 (튜닝 파라미터)
 SIGMA_V_RW   = 0.05                      # [m/s]/sqrt(s)
 SIGMA_PSI_RW = np.deg2rad(0.05)          # [rad]/sqrt(s)
-SIGMA_BG_RW  = np.deg2rad(0.01)          # [rad/s]/sqrt(s)
-SIGMA_BA_RW  = 0.01                      # [m/s^2]/sqrt(s)
+# SIGMA_BG_RW  = np.deg2rad(0.01)          # [rad/s]/sqrt(s)
+# SIGMA_BA_RW  = 0.01                      # [m/s^2]/sqrt(s)
+SIGMA_BG_RW = 5e-6        # rad/s/sqrt(s)
+SIGMA_BA_RW = 2e-5        # m/s^2/sqrt(s)
 
 # GNSS 측정 노이즈 (SimConfig와 맞춰줌)
 SIGMA_GNSS_POS = 1.5    # [m]
@@ -369,7 +371,7 @@ def run_ekf(
     use_ai_bias: bool,
     outage_mask_imu: np.ndarray,
     outage_recovery_time: Optional[float],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 
     """
     return:
@@ -378,6 +380,8 @@ def run_ekf(
     pos_lc = np.zeros((N, 3))
     vel_lc = np.zeros((N, 3))
     quat_lc = np.zeros((N, 4))
+    bg_lc = np.zeros((N,3))
+    ba_lc = np.zeros((N,3))
 
     # 초기 nominal 상태: truth 기준
     pos_lc[0] = truth_pos[0]
@@ -391,6 +395,8 @@ def run_ekf(
     # error state
     x = np.zeros(15)
 
+    sigma_bg0 = 5e-4
+    sigma_ba0 = 5e-4
     P = np.diag(
         [
             10.0, 10.0, 10.0,   # δp [m]
@@ -398,12 +404,20 @@ def run_ekf(
             np.deg2rad(5.0),
             np.deg2rad(5.0),
             np.deg2rad(5.0),    # δψ [rad]
-            np.deg2rad(0.1),
-            np.deg2rad(0.1),
-            np.deg2rad(0.1),    # δbg [rad/s]
-            0.1, 0.1, 0.1,      # δba [m/s^2]
+            sigma_bg0**2,
+            sigma_bg0**2,
+            sigma_bg0**2,
+            sigma_ba0**2,
+            sigma_ba0**2,
+            sigma_ba0**2
         ]
     )
+            # np.deg2rad(0.1),
+            # np.deg2rad(0.1),
+            # np.deg2rad(0.1),    # δbg [rad/s]
+    #         0.1, 0.1, 0.1,      # δba [m/s^2]
+    #     ]
+    # )
 
     q_v   = SIGMA_V_RW**2
     q_psi = SIGMA_PSI_RW**2
@@ -559,13 +573,18 @@ def run_ekf(
             pos_lc[k] = p_corr
             vel_lc[k] = v_corr
             quat_lc[k] = q_corr
+            bg_lc[k] = b_g
+            ba_lc[k] = b_a
+
         else:
             # GNSS 없음: DR + 예측값만 사용
             pos_lc[k] = p_pred
             vel_lc[k] = v_pred
             quat_lc[k] = q_pred
+            bg_lc[k] = b_g
+            ba_lc[k] = b_a
 
-    return pos_lc, vel_lc, quat_lc
+    return pos_lc, vel_lc, quat_lc, bg_lc, ba_lc
 
 
 # -------------------------------------------------------------------
@@ -709,7 +728,7 @@ for k in range(1, N):
 err_ins = np.linalg.norm(pos_dr - truth_pos, axis=1)
 
 # EKF baseline (GRU 미사용)
-pos_lc_base, vel_lc_base, quat_lc_base = run_ekf(
+pos_lc_base, vel_lc_base, quat_lc_base, bg_lc_base, ba_lc_base = run_ekf(
     use_ai_bias=False,
     outage_mask_imu=outage_mask_imu,
     outage_recovery_time=outage_recovery_time,
@@ -717,7 +736,7 @@ pos_lc_base, vel_lc_base, quat_lc_base = run_ekf(
 err_lc_base = np.linalg.norm(pos_lc_base - truth_pos, axis=1)
 
 # EKF + GRU bias
-pos_lc_ai, vel_lc_ai, quat_lc_ai = run_ekf(
+pos_lc_ai, vel_lc_ai, quat_lc_ai, bg_lc_ai, ba_lc_ai = run_ekf(
     use_ai_bias=True,
     outage_mask_imu=outage_mask_imu,
     outage_recovery_time=outage_recovery_time,
@@ -726,7 +745,6 @@ err_lc_ai = np.linalg.norm(pos_lc_ai - truth_pos, axis=1)
 
 # outage 구간 마스크 (자동 검출 결과)
 outage_mask = outage_mask_imu
-
 
 rmse_ins_outage    = np.sqrt(np.mean(err_ins[outage_mask] ** 2))
 rmse_lc_base_out   = np.sqrt(np.mean(err_lc_base[outage_mask] ** 2))
@@ -739,8 +757,22 @@ print(f"GNSS/INS LC + GRU bias (AI)  : {rmse_lc_ai_out:.3f} m")
 
 
 plt.figure(figsize=(12, 6))
-plt.plot(t_imu, err_lc_base, label="GNSS/INS LC (EKF only)", linestyle="--")
-plt.plot(t_imu, err_lc_ai,   label="GNSS/INS LC + GRU bias")
+# plt.plot(t_imu, err_lc_base, label="GNSS/INS LC (EKF only)", linestyle="--")
+# plt.plot(t_imu, err_lc_ai,   label="GNSS/INS LC + GRU bias", linestyle="-.")
+# plt.plot(t_imu, pos_lc_base)
+# err_norm = np.linalg.norm(truth_pos[100::100] - gnss_pos[1:127], axis=1)
+# err = truth_pos[100::100] - gnss_pos[1:127]
+# rmse = np.sqrt(np.mean(err_norm ** 2))
+# std = np.std(err)
+# print(f"err  : {rmse:.3f} m")
+# print(f"std  : {std:.3f} m")
+# plt.plot(t_imu[100::100], err)
+
+# plt.plot(t_gnss, gnss_pos)
+# plt.plot(t_imu, pos_lc_base)
+# plt.plot(pos_lc_base[:,0], pos_lc_base[:,1])
+# plt.plot(gnss_pos[:,0],gnss_pos[:,1])
+plt.plot(t_imu, ba_lc_base)
 
 plt.fill_between(
     t_imu,
@@ -761,3 +793,6 @@ plt.grid(True, alpha=0.3)
 plt.legend()
 plt.tight_layout()
 plt.show()
+
+
+

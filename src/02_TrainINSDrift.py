@@ -243,6 +243,7 @@ class TrainConfig:
     batch_size: int = 64
     val_ratio: float = 0.2
     epochs: int = 30
+    
     hidden_dim: int = 128
     num_layers: int = 2
     dropout: float = 0.1
