@@ -16,7 +16,7 @@ project_dir = os.path.dirname(os.path.dirname(__file__))
 # -------------------------------------------------------------------
 # 설정값
 # -------------------------------------------------------------------
-scenario_num = "scenario_001"
+scenario_num = "scenario_011"
 IMU_CSV   = project_dir + "/outputs/synthetic_multi/" + scenario_num + "/imu_and_ins.csv"
 GNSS_CSV  = project_dir + "/outputs/synthetic_multi/" + scenario_num + "/gnss.csv"
 
