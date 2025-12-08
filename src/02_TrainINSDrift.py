@@ -42,6 +42,8 @@ class DriftSequenceDataset(Dataset):
         include_velocity: bool = True,
         feature_mean: Optional[np.ndarray] = None,
         feature_std: Optional[np.ndarray] = None,
+        label_mean: Optional[np.ndarray] = None,
+        label_std: Optional[np.ndarray] = None,
     ) -> None:
         super().__init__()
         self.csv_path = Path(csv_path)
@@ -131,6 +133,18 @@ class DriftSequenceDataset(Dataset):
         self.times = df["time"].to_numpy(dtype=np.float64)
         self.labels = df[bias_cols].to_numpy(dtype=np.float32)
 
+        if label_mean is None or label_std is None:
+            self.label_mean = self.labels.mean(axis=0).astype(np.float32)
+            self.label_std = self.labels.std(axis=0).astype(np.float32) + 1e-6
+        else:
+            self.label_mean = np.asarray(label_mean, dtype=np.float32)
+            self.label_std = np.asarray(label_std, dtype=np.float32)
+
+        if self.label_mean.shape[0] != self.labels.shape[1]:
+            raise ValueError("Label mean/std dimension mismatch")
+
+        self.labels_norm = ((self.labels - self.label_mean) / self.label_std).astype(np.float32)
+
         # 원본 feature 행렬
         feature_matrix = df[self.feature_columns].to_numpy(dtype=np.float32)
 
@@ -177,7 +191,7 @@ class DriftSequenceDataset(Dataset):
         start = self.indices[idx]
         end = start + self.window_size
         x = torch.from_numpy(self.features[start:end])  # (T, D)
-        y = torch.from_numpy(self.labels[end - 1])      # (6,)
+        y = torch.from_numpy(self.labels_norm[end - 1])  # (6,)
         meta = {
             "time": torch.tensor(self.times[end - 1], dtype=torch.float32),
             "gyro_bias_true": torch.from_numpy(self.labels[end - 1, 0:3]),
@@ -298,6 +312,7 @@ def train_model(cfg: TrainConfig) -> None:
     ).to(device)
     criterion = nn.HuberLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    lambda_smooth = 0.01
 
     best_val_loss = float("inf")
     best_state: Dict[str, torch.Tensor] | None = None
@@ -306,12 +321,23 @@ def train_model(cfg: TrainConfig) -> None:
         model.train()
         train_losses: List[float] = []
         for batch in train_loader:
-            inputs, targets, _ = batch
+            inputs, targets, meta = batch
             inputs = inputs.to(device)
             targets = targets.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            loss_main = criterion(outputs, targets)
+
+            times = meta["time"].to(device)
+            sorted_idx = torch.argsort(times)
+            outputs_sorted = outputs[sorted_idx]
+            if outputs_sorted.size(0) > 1:
+                diffs = outputs_sorted[1:] - outputs_sorted[:-1]
+                loss_smooth = (diffs ** 2).mean()
+            else:
+                loss_smooth = torch.zeros((), device=device)
+
+            loss = loss_main + lambda_smooth * loss_smooth
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
@@ -336,6 +362,8 @@ def train_model(cfg: TrainConfig) -> None:
                 "model_state": model.state_dict(),
                 "feature_mean": full_dataset.feature_mean,
                 "feature_std": full_dataset.feature_std,
+                "label_mean": full_dataset.label_mean,
+                "label_std": full_dataset.label_std,
                 "model_args": {
                     "input_dim": full_dataset.input_dim,
                     "hidden_dim": cfg.hidden_dim,
@@ -378,6 +406,8 @@ def run_evaluation(cfg: EvalConfig) -> None:
         map_location=device,
         weights_only=False,  # PyTorch 2.6 이상에서 필요
     )
+    label_mean = checkpoint["label_mean"]
+    label_std = checkpoint["label_std"]
     model_args = checkpoint["model_args"]
     model = DriftGRUModel(**model_args).to(device)
     model.load_state_dict(checkpoint["model_state"])
@@ -390,6 +420,8 @@ def run_evaluation(cfg: EvalConfig) -> None:
         include_velocity=cfg.include_velocity,
         feature_mean=checkpoint["feature_mean"],
         feature_std=checkpoint["feature_std"],
+        label_mean=label_mean,
+        label_std=label_std,
     )
     loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False)
 
@@ -397,7 +429,8 @@ def run_evaluation(cfg: EvalConfig) -> None:
     with torch.no_grad():
         for inputs, _, meta in loader:
             inputs = inputs.to(device)
-            preds = model(inputs).cpu().numpy()
+            preds_norm = model(inputs).cpu().numpy()
+            preds = preds_norm * label_std[None, :] + label_mean[None, :]
             times = meta["time"].cpu().numpy()
             gyro_bias_true = meta["gyro_bias_true"].cpu().numpy()
             accel_bias_true = meta["accel_bias_true"].cpu().numpy()
@@ -427,6 +460,19 @@ def run_evaluation(cfg: EvalConfig) -> None:
                 )
 
     output_df = pd.DataFrame(rows)
+    for col in [
+        "gyro_bias_pred_x",
+        "gyro_bias_pred_y",
+        "gyro_bias_pred_z",
+        "accel_bias_pred_x",
+        "accel_bias_pred_y",
+        "accel_bias_pred_z",
+    ]:
+        output_df[col + "_smoothed"] = (
+            output_df[col]
+            .rolling(window=5, center=True, min_periods=1)
+            .mean()
+        )
     cfg.output_csv.parent.mkdir(parents=True, exist_ok=True)
     output_df.to_csv(cfg.output_csv, index=False)
     print(f"Saved bias predictions to {cfg.output_csv}")

@@ -5,10 +5,10 @@ python ../src/02_TrainINSDrift.py train \
     --stride 5 \
     --batch-size 64 \
     --val-ratio 0.2 \
-    --epochs 100 \
+    --epochs 300 \
     --hidden-dim 128 \
     --num-layers 2 \
     --dropout 0.1 \
-    --lr 1e-5 \
+    --lr 5e-5 \
     --grad-clip 1.0 \
     --seed 42

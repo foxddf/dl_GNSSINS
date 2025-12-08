@@ -8,6 +8,9 @@ from typing import Tuple
 
 import numpy as np
 import pandas as pd
+import os
+
+project_dir = os.path.dirname(os.path.dirname(__file__))
 
 # WGS-84 constants
 WGS84_A = 6378137.0
@@ -28,12 +31,16 @@ class TrajectoryConfig:
 
 @dataclass
 class IMUErrorModel:
-    gyro_bias_rw: float = 1e-5
-    gyro_noise_std: float = 5e-4
-    accel_bias_rw: float = 5e-5
-    accel_noise_std: float = 1e-3
-    gyro_bias_init_std: float = 5e-4
-    accel_bias_init_std: float = 5e-4
+    gyro_bias_init_std: float | np.ndarray = 5e-4
+    gyro_bias_rw_std: float | np.ndarray = 1e-5
+    gyro_bias_tau: float | np.ndarray | None = None
+    gyro_noise_std: float | np.ndarray = 5e-4
+    gyro_sf_std: float | np.ndarray = 0.0
+    accel_bias_init_std: float | np.ndarray = 5e-4
+    accel_bias_rw_std: float | np.ndarray = 5e-5
+    accel_bias_tau: float | np.ndarray | None = None
+    accel_noise_std: float | np.ndarray = 1e-3
+    accel_sf_std: float | np.ndarray = 0.0
 
 
 @dataclass
@@ -54,7 +61,7 @@ class SimConfig:
     gnss: GNSSNoiseModel = field(default_factory=GNSSNoiseModel)
     gravity: float = 9.80665
     seed: int = 42
-    output_dir: Path = Path("../outputs/synthetic")
+    output_dir: Path = Path(project_dir + "/outputs/synthetic")
 
 
 def generate_time_axes(traj_cfg: TrajectoryConfig, gnss_dt: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -350,22 +357,95 @@ def add_imu_errors(
     dt: float,
     rng: np.random.Generator,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Add IMU errors (scale factor, bias + drift, white noise) to ideal signals.
+
+    Args:
+        gyro_true: Ideal body angular rates [rad/s], shape (N, 3).
+        accel_true: Ideal specific force [m/s^2], shape (N, 3).
+        imu_cfg: IMU error configuration. ``gyro_noise_std``/``accel_noise_std`` are
+            angle/velocity random walk values expressed per sqrt(second) (rad/s/√Hz,
+            rad/√s, m/s^2/√Hz, or m/s/√s). ``gyro_bias_*`` and ``accel_bias_*`` control
+            initial bias, bias random walk or Gauss–Markov drift, and optional time
+            constants. ``gyro_sf_std``/``accel_sf_std`` are scale factor sigmas
+            (dimensionless, e.g. 0.001 for 0.1%).
+        dt: Sample period [s].
+        rng: NumPy random generator for reproducibility.
+
+    Returns:
+        gyro_meas: Noisy gyro measurements.
+        accel_meas: Noisy accelerometer measurements.
+        gyro_bias_hist: Bias history applied to gyro.
+        accel_bias_hist: Bias history applied to accelerometer.
+    """
+
+    def _as_vector(value: float | np.ndarray, name: str) -> np.ndarray:
+        arr = np.asarray(value, dtype=float)
+        if arr.shape == ():
+            return np.full(3, arr, dtype=float)
+        try:
+            return np.broadcast_to(arr, (3,)).astype(float)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be scalar or length-3 array") from exc
+
+    dt = float(dt)
     n = len(gyro_true)
-    gyro_bias = rng.normal(0.0, imu_cfg.gyro_bias_init_std, size=3)
-    accel_bias = rng.normal(0.0, imu_cfg.accel_bias_init_std, size=3)
+
+    gyro_bias_init_std = _as_vector(imu_cfg.gyro_bias_init_std, "gyro_bias_init_std")
+    accel_bias_init_std = _as_vector(imu_cfg.accel_bias_init_std, "accel_bias_init_std")
+    gyro_bias_rw_std = _as_vector(imu_cfg.gyro_bias_rw_std, "gyro_bias_rw_std")
+    accel_bias_rw_std = _as_vector(imu_cfg.accel_bias_rw_std, "accel_bias_rw_std")
+    gyro_noise_std = _as_vector(imu_cfg.gyro_noise_std, "gyro_noise_std")
+    accel_noise_std = _as_vector(imu_cfg.accel_noise_std, "accel_noise_std")
+    gyro_sf_std = _as_vector(imu_cfg.gyro_sf_std, "gyro_sf_std")
+    accel_sf_std = _as_vector(imu_cfg.accel_sf_std, "accel_sf_std")
+
+    gyro_bias_tau_cfg = imu_cfg.gyro_bias_tau
+    accel_bias_tau_cfg = imu_cfg.accel_bias_tau
+    if gyro_bias_tau_cfg is None:
+        gyro_phi = None
+    else:
+        gyro_tau = _as_vector(gyro_bias_tau_cfg, "gyro_bias_tau")
+        gyro_phi = None if not np.all(np.isfinite(gyro_tau)) else np.exp(-dt / gyro_tau)
+    if accel_bias_tau_cfg is None:
+        accel_phi = None
+    else:
+        accel_tau = _as_vector(accel_bias_tau_cfg, "accel_bias_tau")
+        accel_phi = None if not np.all(np.isfinite(accel_tau)) else np.exp(-dt / accel_tau)
+
+    gyro_sf = rng.normal(0.0, gyro_sf_std, size=3)
+    accel_sf = rng.normal(0.0, accel_sf_std, size=3)
+    gyro_bias = rng.normal(0.0, gyro_bias_init_std, size=3)
+    accel_bias = rng.normal(0.0, accel_bias_init_std, size=3)
+
     gyro_meas = np.zeros_like(gyro_true)
     accel_meas = np.zeros_like(accel_true)
     gyro_bias_hist = np.zeros_like(gyro_true)
     accel_bias_hist = np.zeros_like(accel_true)
+
+    gyro_noise_scale = gyro_noise_std / math.sqrt(dt)
+    accel_noise_scale = accel_noise_std / math.sqrt(dt)
+
     for k in range(n):
-        gyro_bias += imu_cfg.gyro_bias_rw * math.sqrt(dt) * rng.normal(size=3)
-        accel_bias += imu_cfg.accel_bias_rw * math.sqrt(dt) * rng.normal(size=3)
-        gyro_noise = (imu_cfg.gyro_noise_std / math.sqrt(dt)) * rng.normal(size=3)
-        accel_noise = (imu_cfg.accel_noise_std / math.sqrt(dt)) * rng.normal(size=3)
-        gyro_meas[k] = gyro_true[k] + gyro_bias + gyro_noise
-        accel_meas[k] = accel_true[k] + accel_bias + accel_noise
+        if gyro_phi is None:
+            gyro_bias += gyro_bias_rw_std * math.sqrt(dt) * rng.normal(size=3)
+        else:
+            gyro_bias = gyro_phi * gyro_bias + gyro_bias_rw_std * np.sqrt(1.0 - gyro_phi * gyro_phi) * rng.normal(size=3)
+
+        if accel_phi is None:
+            accel_bias += accel_bias_rw_std * math.sqrt(dt) * rng.normal(size=3)
+        else:
+            accel_bias = accel_phi * accel_bias + accel_bias_rw_std * np.sqrt(1.0 - accel_phi * accel_phi) * rng.normal(size=3)
+
+        gyro_sf_term = (1.0 + gyro_sf) * gyro_true[k]
+        accel_sf_term = (1.0 + accel_sf) * accel_true[k]
+        gyro_noise = gyro_noise_scale * rng.normal(size=3)
+        accel_noise = accel_noise_scale * rng.normal(size=3)
+
+        gyro_meas[k] = gyro_sf_term + gyro_bias + gyro_noise
+        accel_meas[k] = accel_sf_term + accel_bias + accel_noise
         gyro_bias_hist[k] = gyro_bias
         accel_bias_hist[k] = accel_bias
+
     return gyro_meas, accel_meas, gyro_bias_hist, accel_bias_hist
 
 
@@ -528,7 +608,7 @@ def run_simulation(config: SimConfig) -> None:
     accel_norm = np.linalg.norm(accel_meas, axis=1)
     output_dir = config.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-
+    ## IMU Dataframe
     imu_df = pd.DataFrame(
         {
             "time": imu_times,
@@ -565,6 +645,7 @@ def run_simulation(config: SimConfig) -> None:
 
     imu_path = output_dir / "imu_and_ins.csv"
     imu_df.to_csv(imu_path, index=False)
+    ## GNSS Dataframe
     gnss_df = pd.DataFrame(
         {
             "time": gnss_times,
@@ -584,6 +665,7 @@ def run_simulation(config: SimConfig) -> None:
     )
     gnss_path = output_dir / "gnss.csv"
     gnss_df.to_csv(gnss_path, index=False)
+    ## GNSS, IMU integrated Dataframe
     bias_df = pd.DataFrame(
         {
             "time": imu_times,
@@ -651,12 +733,18 @@ if __name__ == "__main__":
             pattern="multi_segment",
         ),
         imu_errors=IMUErrorModel(
-            gyro_bias_rw=5e-6,
+            gyro_bias_init_std=5e-4,
+            gyro_bias_rw_std=5e-6,
+            gyro_bias_tau=600.0,
             gyro_noise_std=5e-4,
-            accel_bias_rw=2e-5,
+            gyro_sf_std=1e-3,
+            accel_bias_init_std=5e-4,
+            accel_bias_rw_std=2e-5,
+            accel_bias_tau=600.0,
             accel_noise_std=1e-3,
+            accel_sf_std=1e-3,
         ),
         gnss=GNSSNoiseModel(dt=1.0, pos_noise_std=1.5, vel_noise_std=0.2, outage_intervals=((40.0, 60.0),)),
-        output_dir=Path("../outputs/synthetic"),
+        output_dir=Path(project_dir + "/outputs/synthetic"),
     )
     run_simulation(sim_cfg)

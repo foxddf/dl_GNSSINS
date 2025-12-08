@@ -10,17 +10,19 @@ from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from typing import Optional, Sequence, Dict, Tuple, List
 
+import os
 
+project_dir = os.path.dirname(os.path.dirname(__file__))
 # -------------------------------------------------------------------
 # 설정값
 # -------------------------------------------------------------------
-scenario_num = "scenario_006"
-IMU_CSV   = "../outputs/synthetic_multi/" + scenario_num + "/imu_and_ins.csv"
-GNSS_CSV  = "../outputs/synthetic_multi/" + scenario_num + "/gnss.csv"
+scenario_num = "scenario_001"
+IMU_CSV   = project_dir + "/outputs/synthetic_multi/" + scenario_num + "/imu_and_ins.csv"
+GNSS_CSV  = project_dir + "/outputs/synthetic_multi/" + scenario_num + "/gnss.csv"
 
 # GRU가 학습에 사용한 bias_training.csv & 체크포인트
-BIAS_CSV        = "../outputs/synthetic_multi/" + scenario_num + "/bias_training.csv"
-CHECKPOINT_PATH = "../outputs/artifacts/drift_gru.pt"
+BIAS_CSV        = project_dir + "/outputs/synthetic_multi/" + scenario_num + "/bias_training.csv"
+CHECKPOINT_PATH = project_dir + "/outputs/artifacts/drift_gru.pt"
 
 G = 9.80665  # [m/s^2]
 
@@ -29,12 +31,20 @@ SIGMA_V_RW   = 0.05                      # [m/s]/sqrt(s)
 SIGMA_PSI_RW = np.deg2rad(0.05)          # [rad]/sqrt(s)
 # SIGMA_BG_RW  = np.deg2rad(0.01)          # [rad/s]/sqrt(s)
 # SIGMA_BA_RW  = 0.01                      # [m/s^2]/sqrt(s)
-SIGMA_BG_RW = 5e-6        # rad/s/sqrt(s)
-SIGMA_BA_RW = 2e-5        # m/s^2/sqrt(s)
+SIGMA_BG_RW = 5e-4        # rad/s/sqrt(s)
+SIGMA_BA_RW = 2e-3        # m/s^2/sqrt(s)
+
+# AI bias pseudo-measurement noise (tune as needed)
+SIGMA_AI_BG_MEAS = 1e-3   # [rad/s]
+SIGMA_AI_BA_MEAS = 4e-3   # [m/s^2]
+# Optional scaling to trust AI bias more during GNSS outages
+AI_BIAS_R_OUTAGE_SCALE = 1
+AI_UPDATE_DECIMATION = 10   # 100 Hz / 10 = 10 Hz
 
 # GNSS 측정 노이즈 (SimConfig와 맞춰줌)
-SIGMA_GNSS_POS = 1.5    # [m]
+SIGMA_GNSS_POS = 0.5    # [m]
 SIGMA_GNSS_VEL = 0.2    # [m/s]
+
 
 
 # -------------------------------------------------------------------
@@ -445,13 +455,8 @@ def run_ekf(
         p_prev = pos_lc[k - 1]
         v_prev = vel_lc[k - 1]
 
-        # use_ai_bias=True 이고 outage 구간이면 GRU bias 사용
-        if use_ai_bias and in_outage:
-            omega_b = gyro_meas[k - 1] - (b_g + bg_ai[k - 1])
-            accel_b = accel_meas[k - 1] - (b_a + ba_ai[k - 1])
-        else:
-            omega_b = gyro_meas[k - 1] - b_g
-            accel_b = accel_meas[k - 1] - b_a
+        omega_b = gyro_meas[k - 1] - b_g
+        accel_b = accel_meas[k - 1] - b_a
 
         q_pred = integrate_quat(q_prev, omega_b, dt)
         C_nb = quat_to_dcm(q_pred)
@@ -489,7 +494,7 @@ def run_ekf(
             gnss_idx += 1
 
         if gnss_idx < gnss_len:
-            if abs(t_gnss[gnss_idx] - t_k) <= 0.5:
+            if abs(t_gnss[gnss_idx] - t_k) <= 0.5 * dt:
                 z_pos = gnss_pos[gnss_idx]
                 z_vel = gnss_vel[gnss_idx]
                 if (
@@ -533,7 +538,9 @@ def run_ekf(
                 continue
 
 
-        # 일반 GNSS update
+        measurement_applied = False
+
+        # GNSS update
         if gnss_valid and z is not None:
             h = np.concatenate([p_pred + x[0:3], v_pred + x[3:6]])
             y = z - h
@@ -554,6 +561,38 @@ def run_ekf(
             I = np.eye(15)
             P = (I - K @ H) @ P @ (I - K @ H).T + K @ R @ K.T
 
+            measurement_applied = True
+
+        # AI bias pseudo-measurement update (available on IMU timeline)
+        ai_bias_available = use_ai_bias and ai_bias_valid[k] \
+            and (k % AI_UPDATE_DECIMATION == 0) \
+            and (not np.any(np.isnan(bg_ai[k])) and not np.any(np.isnan(ba_ai[k])))
+        if ai_bias_available:
+            z_b = np.concatenate([bg_ai[k], ba_ai[k]])
+            h_b = np.concatenate([b_g, b_a])
+            y_b = z_b - h_b
+
+            H_b = np.zeros((6, 15))
+            H_b[0:3, 9:12] = np.eye(3)
+            H_b[3:6, 12:15] = np.eye(3)
+
+            R_b = np.zeros((6, 6))
+            R_b[0:3, 0:3] = (SIGMA_AI_BG_MEAS**2) * np.eye(3)
+            R_b[3:6, 3:6] = (SIGMA_AI_BA_MEAS**2) * np.eye(3)
+            if in_outage:
+                R_b *= AI_BIAS_R_OUTAGE_SCALE
+
+            S_b = H_b @ P @ H_b.T + R_b
+            K_b = P @ H_b.T @ np.linalg.inv(S_b)
+
+            x = x + K_b @ y_b
+
+            I = np.eye(15)
+            P = (I - K_b @ H_b) @ P @ (I - K_b @ H_b).T + K_b @ R_b @ K_b.T
+
+            measurement_applied = True
+
+        if measurement_applied:
             delta_p   = x[0:3]
             delta_v   = x[3:6]
             delta_psi = x[6:9]
@@ -575,9 +614,8 @@ def run_ekf(
             quat_lc[k] = q_corr
             bg_lc[k] = b_g
             ba_lc[k] = b_a
-
         else:
-            # GNSS 없음: DR + 예측값만 사용
+            # no measurement: propagate only
             pos_lc[k] = p_pred
             vel_lc[k] = v_pred
             quat_lc[k] = q_pred
@@ -613,7 +651,6 @@ N = len(t_imu)
 dt_imu = np.diff(t_imu, prepend=t_imu[0])
 g_n = np.array([0.0, 0.0, -G])  # ENU up 기준
 
-
 # -------------------------------------------------------------------
 # 1-a) bias_training.csv 기반 GNSS outage 자동 검출
 # -------------------------------------------------------------------
@@ -642,6 +679,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ckpt = torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False)
 
 model_args = ckpt["model_args"]
+feature_mean = ckpt["feature_mean"]
+feature_std = ckpt["feature_std"]
+label_mean = ckpt["label_mean"]
+label_std = ckpt["label_std"]
+
 model = DriftGRUModel(**model_args).to(device)
 model.load_state_dict(ckpt["model_state"])
 model.eval()
@@ -664,7 +706,12 @@ count_ai = np.zeros(N, dtype=int)
 with torch.no_grad():
     for inputs, _, meta in loader:
         inputs = inputs.to(device)
-        preds = model(inputs).cpu().numpy()  # (B, 6)
+        # preds = model(inputs).cpu().numpy()  # (B, 6)
+        preds_norm = model(inputs).cpu().numpy()  # (B, 6)
+
+        # 역정규화: 실제 bias 단위로 변환
+        preds = preds_norm * label_std[None, :] + label_mean[None, :]
+
         times = meta["time"].cpu().numpy()   # (B,)
 
         for i in range(preds.shape[0]):
@@ -679,6 +726,9 @@ with torch.no_grad():
 valid_idx = count_ai > 0
 bg_ai[valid_idx] /= count_ai[valid_idx, None]
 ba_ai[valid_idx] /= count_ai[valid_idx, None]
+ai_bias_valid = valid_idx
+bg_ai[~ai_bias_valid] = np.nan
+ba_ai[~ai_bias_valid] = np.nan
 
 # bias RMSE (전체 구간, 참고용)
 rmse_bg = np.sqrt(np.mean((bg_ai - gyro_bias_true) ** 2))
@@ -757,8 +807,20 @@ print(f"GNSS/INS LC + GRU bias (AI)  : {rmse_lc_ai_out:.3f} m")
 
 
 plt.figure(figsize=(12, 6))
-# plt.plot(t_imu, err_lc_base, label="GNSS/INS LC (EKF only)", linestyle="--")
-# plt.plot(t_imu, err_lc_ai,   label="GNSS/INS LC + GRU bias", linestyle="-.")
+# plt.plot(t_imu, truth_pos, label="Truth pos")
+# plt.plot(t_imu, pos_lc_base, label='lc pos')
+# plt.plot(truth_pos[:,0], truth_pos[:,1], label='truth')
+# plt.plot(pos_lc_base[:,0], pos_lc_base[:,1], label='lc pos')
+# plt.plot(pos_lc_ai[:,0], pos_lc_ai[:,1], label='ai pos')
+
+# plt.plot(t_imu, bg_ai, label='bg ai')
+# plt.plot(t_imu, gyro_bias_true, label='true')
+
+# plt.plot(t_imu, ba_ai, label='ba ai')
+# plt.plot(t_imu, accel_bias_true, label='true')
+
+plt.plot(t_imu, err_lc_base, label="GNSS/INS LC (EKF only)", linestyle="--")
+plt.plot(t_imu, err_lc_ai,   label="GNSS/INS LC + GRU bias", linestyle="-.")
 # plt.plot(t_imu, pos_lc_base)
 # err_norm = np.linalg.norm(truth_pos[100::100] - gnss_pos[1:127], axis=1)
 # err = truth_pos[100::100] - gnss_pos[1:127]
@@ -772,16 +834,18 @@ plt.figure(figsize=(12, 6))
 # plt.plot(t_imu, pos_lc_base)
 # plt.plot(pos_lc_base[:,0], pos_lc_base[:,1])
 # plt.plot(gnss_pos[:,0],gnss_pos[:,1])
-plt.plot(t_imu, ba_lc_base)
+# plt.plot(t_imu, ba_lc_base[:,1])
+# plt.plot(t_imu, accel_bias_true[:,1])
 
-plt.fill_between(
-    t_imu,
-    0,
-    np.nanmax(np.concatenate([err_lc_base, err_lc_ai])),
-    where=outage_mask,
-    alpha=0.1,
-    label="GNSS outage",
-)
+
+# plt.fill_between(
+#     t_imu,
+#     0,
+#     np.nanmax(np.concatenate([err_lc_base, err_lc_ai])),
+#     where=outage_mask,
+#     alpha=0.1,
+#     label="GNSS outage",
+# )
 
 # -------------------------------------------------------------------
 # 플롯
@@ -793,6 +857,3 @@ plt.grid(True, alpha=0.3)
 plt.legend()
 plt.tight_layout()
 plt.show()
-
-
-
